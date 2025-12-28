@@ -18,6 +18,8 @@
 
 
 import logging
+import os
+import sys
 import traceback
 from contextlib import nullcontext
 from copy import copy
@@ -123,9 +125,14 @@ def init_keyboard_listener():
     the program flow during execution, such as stopping recording or exiting loops. It gracefully
     handles headless environments where keyboard listening is not possible.
 
+    On Wayland, falls back to terminal input mode where user types:
+    - 'n' + Enter: next episode (equivalent to right arrow)
+    - 'r' + Enter: rerecord episode (equivalent to left arrow)
+    - 'q' + Enter: quit (equivalent to ESC)
+
     Returns:
         A tuple containing:
-        - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
+        - The `pynput.keyboard.Listener` instance, or a terminal listener, or `None` if in a headless environment.
         - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
     """
     # Allow to exit early while recording an episode or resetting the environment,
@@ -136,6 +143,16 @@ def init_keyboard_listener():
     events["rerecord_episode"] = False
     events["stop_recording"] = False
 
+    # Check for Wayland - pynput doesn't work on Wayland
+    session_type = os.environ.get("XDG_SESSION_TYPE", "").lower()
+    if session_type == "wayland":
+        logging.warning(
+            "Wayland detected. pynput cannot capture global keyboard events on Wayland. "
+            "Using terminal input mode instead. "
+            "Type 'n' (next), 'r' (rerecord), or 'q' (quit) in the terminal."
+        )
+        return _init_terminal_input_listener(events)
+
     if is_headless():
         logging.warning(
             "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
@@ -144,7 +161,14 @@ def init_keyboard_listener():
         return listener, events
 
     # Only import pynput if not in a headless environment
-    from pynput import keyboard
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        logging.warning(
+            f"Failed to import pynput: {e}. Falling back to terminal input mode. "
+            "Type 'n' (next), 'r' (rerecord), or 'q' (quit) in the terminal."
+        )
+        return _init_terminal_input_listener(events)
 
     def on_press(key):
         try:
@@ -162,9 +186,162 @@ def init_keyboard_listener():
         except Exception as e:
             print(f"Error handling key press: {e}")
 
-    listener = keyboard.Listener(on_press=on_press)
-    listener.start()
+    try:
+        listener = keyboard.Listener(on_press=on_press)
+        listener.start()
+        return listener, events
+    except Exception as e:
+        logging.warning(
+            f"Failed to start pynput listener: {e}. Falling back to terminal input mode. "
+            "Type 'n' (next), 'r' (rerecord), or 'q' (quit) in the terminal."
+        )
+        return _init_terminal_input_listener(events)
 
+
+def _init_terminal_input_listener(events):
+    """
+    Initialize a terminal-based input listener for Wayland compatibility.
+    This reads single characters from stdin without requiring Enter.
+    """
+    import threading
+    import queue as queue_module
+    import select
+    
+    input_queue = queue_module.Queue()
+    running = threading.Event()
+    running.set()
+    
+    def input_thread():
+        """Background thread to read single character input"""
+        print("\n" + "="*60)
+        print("Terminal Input Mode (Wayland compatible)")
+        print("="*60)
+        print("Single key commands (no Enter needed):")
+        print("  → (Right Arrow) or n: Next episode (skip current)")
+        print("  ← (Left Arrow) or r: Rerecord current episode")
+        print("  ESC or q: Quit recording")
+        print("="*60 + "\n")
+        
+        # Try to set terminal to raw mode for single character input
+        try:
+            import termios
+            import tty
+            
+            if sys.stdin.isatty():
+                # Save terminal settings
+                old_settings = termios.tcgetattr(sys.stdin)
+                # Set terminal to raw mode
+                tty.setraw(sys.stdin.fileno())
+                
+                try:
+                    while running.is_set():
+                        # Check if input is available (non-blocking)
+                        if select.select([sys.stdin], [], [], 0.1)[0]:
+                            char = sys.stdin.read(1)
+                            if char:
+                                # Handle escape sequences for arrow keys
+                                if char == '\x1b':  # ESC character
+                                    # Check for arrow key sequences
+                                    if select.select([sys.stdin], [], [], 0.1)[0]:
+                                        seq = sys.stdin.read(2)
+                                        if seq == '[C':  # Right arrow
+                                            input_queue.put('right')
+                                        elif seq == '[D':  # Left arrow
+                                            input_queue.put('left')
+                                        elif seq == '[A':  # Up arrow
+                                            pass  # Ignore
+                                        elif seq == '[B':  # Down arrow
+                                            pass  # Ignore
+                                        else:
+                                            # Just ESC key
+                                            input_queue.put('esc')
+                                    else:
+                                        # Just ESC key
+                                        input_queue.put('esc')
+                                elif char == '\x03':  # Ctrl+C
+                                    running.clear()
+                                    break
+                                elif char.lower() == 'n':
+                                    input_queue.put('n')
+                                elif char.lower() == 'r':
+                                    input_queue.put('r')
+                                elif char.lower() == 'q':
+                                    input_queue.put('q')
+                        else:
+                            # No input, continue
+                            pass
+                finally:
+                    # Restore terminal settings
+                    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+            else:
+                # Not a TTY, fall back to line-based input
+                while running.is_set():
+                    try:
+                        user_input = input().strip().lower()
+                        input_queue.put(user_input)
+                    except (EOFError, KeyboardInterrupt):
+                        running.clear()
+                        break
+                    except Exception:
+                        import time
+                        time.sleep(0.1)
+        except (ImportError, OSError):
+            # termios not available (Windows or other), fall back to line input
+            logging.warning("termios not available, using line-based input (requires Enter)")
+            while running.is_set():
+                try:
+                    if sys.stdin.isatty():
+                        user_input = input().strip().lower()
+                        input_queue.put(user_input)
+                    else:
+                        import time
+                        time.sleep(0.1)
+                except (EOFError, KeyboardInterrupt):
+                    running.clear()
+                    break
+                except Exception:
+                    import time
+                    time.sleep(0.1)
+    
+    def check_input():
+        """Check input queue and update events - call this in main loop"""
+        while not input_queue.empty():
+            try:
+                cmd = input_queue.get_nowait()
+                if cmd in ('n', 'right'):
+                    print("\n✓ Next episode (exiting current loop)...")
+                    events["exit_early"] = True
+                elif cmd in ('r', 'left'):
+                    print("\n✓ Rerecord episode (exiting and clearing buffer)...")
+                    events["rerecord_episode"] = True
+                    events["exit_early"] = True
+                elif cmd in ('q', 'esc'):
+                    print("\n✓ Quit recording...")
+                    events["stop_recording"] = True
+                    events["exit_early"] = True
+                    running.clear()
+            except Exception:
+                pass
+    
+    thread = threading.Thread(target=input_thread, daemon=True)
+    thread.start()
+    
+    class TerminalListener:
+        def __init__(self):
+            self._running = running
+            self._check_input = check_input
+        
+        def is_alive(self):
+            return self._running.is_set()
+        
+        def stop(self):
+            self._running.clear()
+        
+        def check(self):
+            """Call this in the main loop to check for input"""
+            check_input()
+    
+    listener = TerminalListener()
     return listener, events
 
 

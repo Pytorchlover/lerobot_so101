@@ -93,6 +93,8 @@ class SO101Leader(Teleoperator):
             )
             if user_input.strip().lower() != "c":
                 logger.info(f"Writing calibration file associated with the id {self.id} to the motors")
+                # Disable torque before writing calibration to prevent motors from moving unexpectedly
+                self.bus.disable_torque()
                 self.bus.write_calibration(self.calibration)
                 return
 

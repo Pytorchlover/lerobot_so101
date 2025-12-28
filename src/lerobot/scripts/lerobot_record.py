@@ -256,6 +256,7 @@ def record_loop(
     control_time_s: int | None = None,
     single_task: str | None = None,
     display_data: bool = False,
+    listener=None,  # Keyboard listener (for Wayland terminal input mode)
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -290,6 +291,10 @@ def record_loop(
     start_episode_t = time.perf_counter()
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
+
+        # Check for terminal input if using terminal listener (Wayland mode)
+        if listener is not None and hasattr(listener, 'check'):
+            listener.check()
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -464,6 +469,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 control_time_s=cfg.dataset.episode_time_s,
                 single_task=cfg.dataset.single_task,
                 display_data=cfg.display_data,
+                listener=listener,
             )
 
             # Execute a few seconds without recording to give time to manually reset the environment
@@ -483,6 +489,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     control_time_s=cfg.dataset.reset_time_s,
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
+                    listener=listener,
                 )
 
             if events["rerecord_episode"]:
